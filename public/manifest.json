@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "CredLens AI",
+  "version": "1.0.0",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://www.youtube.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/index.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "src/content/index.tsx"
+      ]
+    }
+  ],
+  "action": {
+    "default_popup": "index.html"
+  }
+}
