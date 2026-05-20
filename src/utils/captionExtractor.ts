@@ -17,8 +17,7 @@ export class CaptionExtractor {
       if (text) callback(text);
     });
 
-    // We observe the body or a specific player container
-    // To be safe and minimal, we observe the whole document for caption segment additions
+
     observer.observe(document.body, {
       childList: true,
       subtree: true

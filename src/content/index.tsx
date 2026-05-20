@@ -1,10 +1,10 @@
-import { useState, useEffect, useRef } from 'react';
-import ReactDOM from 'react-dom/client';
-import { GeminiService } from '../services/geminiService.ts';
-import { CaptionExtractor } from '../utils/captionExtractor.ts';
-import type { VideoState } from '../types';
-import CredibilityOverlay from '../components/CredibilityOverlay.tsx';
-import '../index.css';
+import { useState, useEffect, useRef } from "react";
+import ReactDOM from "react-dom/client";
+import { GeminiService } from "../services/geminiService.ts";
+import { CaptionExtractor } from "../utils/captionExtractor.ts";
+import type { VideoState } from "../types";
+import CredibilityOverlay from "../components/CredibilityOverlay.tsx";
+import "../index.css";
 
 const YouTubeShortsDetector = () => {
   const [activeVideo, setActiveVideo] = useState<VideoState | null>(null);
@@ -19,9 +19,11 @@ const YouTubeShortsDetector = () => {
     const handleUrlChange = () => {
       console.log("URL changed:", window.location.href);
       const url = window.location.href;
-      if (url.includes('/shorts/')) {
-        const videoId = url.split('/shorts/')[1].split('?')[0];
+      if (url.includes("/shorts/")) {
+        const videoId = url.split("/shorts/")[1].split("?")[0];
         console.log("Detected Shorts video:", videoId);
+        transcriptRef.current = "";
+        analysisInProgress.current = false;
         if (activeVideo?.videoId !== videoId) {
           resetAndStartNewVideo(videoId);
         }
@@ -31,11 +33,11 @@ const YouTubeShortsDetector = () => {
     };
 
     // Listen for navigation changes (YouTube uses SPA navigation)
-    window.addEventListener('yt-navigate-finish', handleUrlChange);
+    window.addEventListener("yt-navigate-finish", handleUrlChange);
     handleUrlChange(); // Initial check
 
     return () => {
-      window.removeEventListener('yt-navigate-finish', handleUrlChange);
+      window.removeEventListener("yt-navigate-finish", handleUrlChange);
     };
   }, [activeVideo]);
 
@@ -56,40 +58,41 @@ const YouTubeShortsDetector = () => {
     setActiveVideo({
       videoId,
       viewTime: 0,
-      processed: false
+      processed: false,
     });
     console.log("Starting 3-second timer for:", videoId);
     // STEP 3: Swipe Ignore System (3s)
     viewTimerRef.current = setTimeout(() => {
-      console.log("User stayed long enough. Waiting for transcript stabilization...");
+      console.log(
+        "User stayed long enough. Waiting for transcript stabilization...",
+      );
     }, 3000);
   };
 
   const shouldIgnoreTranscript = (text: string): boolean => {
-
     if (!text) return true;
 
     const cleaned = text.toLowerCase().trim();
 
     const musicPatterns = [
-      '[music]',
-      '[musique]',
-      '[musik]',
-      '[música]',
-      '[संगीत]',
-      '[సంగీతం]',
-      '[음악]',
-      '[музыка]',
-      '[音楽]',
-      '[音乐]'
+      "[music]",
+      "[musique]",
+      "[musik]",
+      "[música]",
+      "[संगीत]",
+      "[సంగీతం]",
+      "[음악]",
+      "[музыка]",
+      "[音楽]",
+      "[音乐]",
     ];
 
     if (
-      musicPatterns.some(pattern =>
-        cleaned.includes(pattern.toLowerCase())
+      musicPatterns.some((pattern) =>
+        cleaned.includes(pattern.toLowerCase()),
       ) ||
-      cleaned.includes('♪') ||
-      cleaned.includes('♫')
+      cleaned.includes("♪") ||
+      cleaned.includes("♫")
     ) {
       return true;
     }
@@ -145,7 +148,7 @@ const YouTubeShortsDetector = () => {
 
     const finalTranscript = cleanTranscript(transcriptRef.current);
 
-    if (finalTranscript.length < 20) {
+    if (!finalTranscript || finalTranscript.length < 10) {
       console.log("Transcript too short after stabilization");
       return;
     }
@@ -161,9 +164,11 @@ const YouTubeShortsDetector = () => {
 
     console.log("Starting AI analysis...");
 
-    const settings = await chrome.storage.local.get(['geminiApiKey']) as {
+    const settings = (await chrome.storage.local.get(["geminiApiKey"])) as {
       geminiApiKey?: string;
     };
+
+    console.log("Stored Gemini Key:", settings.geminiApiKey);
 
     if (!settings.geminiApiKey) {
       console.warn("Gemini API key not found");
@@ -176,62 +181,49 @@ const YouTubeShortsDetector = () => {
 
     const result = await gemini.analyzeTranscript(
       finalTranscript,
-      abortControllerRef.current.signal
+      abortControllerRef.current.signal,
     );
 
-    setActiveVideo(prev =>
+    setActiveVideo((prev) =>
       prev && prev.videoId === videoId
         ? {
-          ...prev,
-          processed: true,
-          analysis: result
-        }
-        : prev
+            ...prev,
+            processed: true,
+            analysis: result,
+          }
+        : prev,
     );
   };
 
   useEffect(() => {
     // Start observing captions
     const observer = CaptionExtractor.observeCaptions((text) => {
+      if (!text) {
+        return;
+      }
+
+      if (!transcriptRef.current.includes(text)) {
+        transcriptRef.current += " " + text;
+      }
+
+      // if (shouldIgnoreTranscript(text)) {
+      //   console.log("Ignoring music or low-information content early");
+      //   return;
+      // }
+
       if (
-        !text ||
-        Math.abs(text.length - transcriptRef.current.length) <= 40
+        !analysisInProgress.current &&
+        transcriptRef.current.split(" ").length > 80
       ) {
-        return;
-      }
-
-      transcriptRef.current = text;
-
-      if (shouldIgnoreTranscript(text)) {
-        console.log("Ignoring music or low-information content early");
-        return;
-      }
-
-      // Reset stabilization timer whenever transcript changes
-      if (stabilizationTimerRef.current) {
-        clearTimeout(stabilizationTimerRef.current);
-      }
-
-      stabilizationTimerRef.current = setTimeout(() => {
-        // Only analyze if transcript hasn't changed
-        const difference = Math.abs(
-          lastTranscriptRef.current.length -
-          transcriptRef.current.length
-        );
-
-        if (difference > 40) {
-          lastTranscriptRef.current = transcriptRef.current;
-
-          console.log("Transcript still changing...");
-          return;
-        }
+        analysisInProgress.current = true;
 
         console.log("Transcript stabilized");
+        console.log("Starting AI analysis...");
 
         if (activeVideo?.videoId) {
           startAnalysis(activeVideo.videoId);
         }
-      }, 3500);
+      }
     });
 
     return () => observer.disconnect();
@@ -251,17 +243,17 @@ const YouTubeShortsDetector = () => {
 // Initialize Shadow DOM
 const init = () => {
   console.log("CredLens extension injected");
-  const container = document.createElement('div');
-  container.id = 'credlens-root';
+  const container = document.createElement("div");
+  container.id = "credlens-root";
   document.body.appendChild(container);
 
-  const shadowRoot = container.attachShadow({ mode: 'open' });
-  const shadowWrapper = document.createElement('div');
-  shadowWrapper.id = 'credlens-shadow-wrapper';
+  const shadowRoot = container.attachShadow({ mode: "open" });
+  const shadowWrapper = document.createElement("div");
+  shadowWrapper.id = "credlens-shadow-wrapper";
   shadowRoot.appendChild(shadowWrapper);
 
   // Inject styles into shadow DOM
-  const style = document.createElement('style');
+  const style = document.createElement("style");
   // We'll need to fetch the injected CSS or use a small subset
   // For now, let's use a basic style injection
   style.textContent = `
@@ -284,5 +276,5 @@ const init = () => {
 if (document.body) {
   init();
 } else {
-  window.addEventListener('DOMContentLoaded', init);
+  window.addEventListener("DOMContentLoaded", init);
 }

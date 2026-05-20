@@ -7,14 +7,14 @@ export class GeminiService {
 
   constructor(apiKey: string) {
     this.genAI = new GoogleGenerativeAI(apiKey);
-    this.model = this.genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    this.model = this.genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
   }
 
   async analyzeTranscript(transcript: string, signal?: AbortSignal): Promise<ClaimAnalysis> {
     const prompt = `
       Analyze the following transcript from a short-form video.
       Your task is to determine if it contains factual claims that can be verified.
-      
+
       CRITICAL RULES:
       1. If the content is satire, comedy, jokes, sarcasm, storytelling, or fictional entertainment, set isSatire to true.
       2. If it is satire/comedy, do not look for factual claims.
@@ -35,11 +35,11 @@ export class GeminiService {
     `;
 
     try {
-      const result = await this.model.generateContent({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {},
-        signal
-      });
+      const result = await this.model.generateContent(prompt);
+      
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
       const response = await result.response;
       const text = response.text();
       console.log("Raw Gemini response:", text);
