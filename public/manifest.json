@@ -1,13 +1,18 @@
 {
   "manifest_version": 3,
   "name": "CredLens AI",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Real-time fact verification for YouTube Shorts using Gemini AI, PubMed, Google Fact Check, and trusted news sources.",
   "permissions": [
     "storage",
     "activeTab"
   ],
   "host_permissions": [
-    "https://www.youtube.com/*"
+    "https://www.youtube.com/*",
+    "https://factchecktools.googleapis.com/*",
+    "https://eutils.ncbi.nlm.nih.gov/*",
+    "https://news.google.com/*",
+    "https://generativelanguage.googleapis.com/*"
   ],
   "background": {
     "service_worker": "src/background/index.ts",
@@ -24,6 +29,7 @@
     }
   ],
   "action": {
-    "default_popup": "index.html"
+    "default_popup": "index.html",
+    "default_title": "CredLens AI"
   }
 }

@@ -1,29 +1,72 @@
 import { useState, useEffect, useRef } from "react";
 import ReactDOM from "react-dom/client";
-import { GeminiService } from "../services/geminiService.ts";
 import { CaptionExtractor } from "../utils/captionExtractor.ts";
-import type { VideoState } from "../types";
+import { preFilterTranscript, deduplicateTranscript } from "../utils/transcriptFilter.ts";
+import type { VideoState, BackgroundResponse } from "../types";
 import CredibilityOverlay from "../components/CredibilityOverlay.tsx";
+import { Loader2, AlertCircle, X } from "lucide-react";
 import "../index.css";
 
 const YouTubeShortsDetector = () => {
   const [activeVideo, setActiveVideo] = useState<VideoState | null>(null);
-  const viewTimerRef = useRef<any>(null);
+  const swipeLockRef = useRef(true);         // true = still in 3-s swipe cooldown
   const transcriptRef = useRef("");
-  const stabilizationTimerRef = useRef<any>(null);
-  const lastTranscriptRef = useRef("");
-  const analysisInProgress = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const seenSegmentsRef = useRef(new Set<string>()); // dedup individual caption segments
+  const analysisTriggered = useRef(false);
+  const debounceTimerRef = useRef<any>(null); // debounce rapid caption bursts
+  const portRef = useRef<chrome.runtime.Port | null>(null);
 
+  // 1. Establish long-lived Port connection with Background Service Worker
+  useEffect(() => {
+    const connectPort = () => {
+      console.log("[Content] Connecting to CredLens background port...");
+      const port = chrome.runtime.connect({ name: "credlens-verification" });
+      portRef.current = port;
+
+      port.onMessage.addListener((message: BackgroundResponse) => {
+        const { status, videoId, analysis, error } = message;
+        console.log(`[Content] Port Message: ${status} for video ${videoId}`, message);
+
+        setActiveVideo((prev) => {
+          if (!prev || prev.videoId !== videoId) return prev;
+          
+          return {
+            ...prev,
+            status,
+            processed: status === "completed",
+            analysis: status === "completed" ? analysis : prev.analysis,
+          };
+        });
+
+        if (status === "error" && error) {
+          console.warn("[Content] Background pipeline reported error:", error);
+        }
+      });
+
+      port.onDisconnect.addListener(() => {
+        console.warn("[Content] Background port disconnected. Reconnecting in 3s...");
+        portRef.current = null;
+        setTimeout(connectPort, 3000);
+      });
+    };
+
+    connectPort();
+
+    return () => {
+      if (portRef.current) {
+        portRef.current.disconnect();
+      }
+    };
+  }, []);
+
+  // 2. Detect YouTube Shorts URL navigation (YouTube uses SPA navigation)
   useEffect(() => {
     const handleUrlChange = () => {
-      console.log("URL changed:", window.location.href);
       const url = window.location.href;
       if (url.includes("/shorts/")) {
         const videoId = url.split("/shorts/")[1].split("?")[0];
-        console.log("Detected Shorts video:", videoId);
-        transcriptRef.current = "";
-        analysisInProgress.current = false;
+        console.log("[Content] Detected Shorts video:", videoId);
+        
         if (activeVideo?.videoId !== videoId) {
           resetAndStartNewVideo(videoId);
         }
@@ -32,7 +75,6 @@ const YouTubeShortsDetector = () => {
       }
     };
 
-    // Listen for navigation changes (YouTube uses SPA navigation)
     window.addEventListener("yt-navigate-finish", handleUrlChange);
     handleUrlChange(); // Initial check
 
@@ -42,207 +84,203 @@ const YouTubeShortsDetector = () => {
   }, [activeVideo]);
 
   const resetAndStartNewVideo = (videoId: string) => {
-    // Clear previous state
-    if (viewTimerRef.current) {
-      console.log("Previous analysis cancelled due to swipe");
-      clearTimeout(viewTimerRef.current);
+    // Cancel any pending debounce
+    if (debounceTimerRef.current) {
+      clearTimeout(debounceTimerRef.current);
+      debounceTimerRef.current = null;
     }
 
-    if (abortControllerRef.current) {
-      console.log("Aborting active Gemini request...");
-      abortControllerRef.current.abort();
+    // Notify background worker to abort active fetches for old video
+    if (activeVideo?.videoId && portRef.current) {
+      console.log(`[Content] Swiped away from ${activeVideo.videoId}. Requesting cancellation.`);
+      try {
+        portRef.current.postMessage({
+          action: "CANCEL_VERIFICATION",
+          videoId: activeVideo.videoId,
+        });
+      } catch (err) {
+        console.warn("[Content] Port failed to send cancel message:", err);
+      }
     }
+
+    // Reset all per-video state
     transcriptRef.current = "";
-    analysisInProgress.current = false;
+    seenSegmentsRef.current.clear();
+    analysisTriggered.current = false;
+    swipeLockRef.current = true; // engage swipe lock
+    CaptionExtractor.reset();
 
     setActiveVideo({
       videoId,
       viewTime: 0,
       processed: false,
     });
-    console.log("Starting 3-second timer for:", videoId);
-    // STEP 3: Swipe Ignore System (3s)
-    viewTimerRef.current = setTimeout(() => {
-      console.log(
-        "User stayed long enough. Waiting for transcript stabilization...",
-      );
+
+    console.log(`[Content] Swipe lock started for: ${videoId}`);
+    // Release swipe lock after 3 s — only then do we start collecting captions
+    setTimeout(() => {
+      swipeLockRef.current = false;
+      console.log("[Content] Swipe lock released. Ready for captions.");
     }, 3000);
   };
 
-  const shouldIgnoreTranscript = (text: string): boolean => {
-    if (!text) return true;
+  // shouldIgnoreTranscript and cleanTranscript are now handled by
+  // preFilterTranscript() and deduplicateTranscript() from transcriptFilter.ts
 
-    const cleaned = text.toLowerCase().trim();
+  // Send cleaned, pre-filtered transcript to Background Service Worker
+  const triggerBackgroundVerification = (videoId: string) => {
+    // Deduplicate the raw buffer (fixes progressive caption double-append)
+    const deduped = deduplicateTranscript(transcriptRef.current);
 
-    const musicPatterns = [
-      "[music]",
-      "[musique]",
-      "[musik]",
-      "[música]",
-      "[संगीत]",
-      "[సంగీతం]",
-      "[음악]",
-      "[музыка]",
-      "[音楽]",
-      "[音乐]",
-    ];
-
-    if (
-      musicPatterns.some((pattern) =>
-        cleaned.includes(pattern.toLowerCase()),
-      ) ||
-      cleaned.includes("♪") ||
-      cleaned.includes("♫")
-    ) {
-      return true;
-    }
-
-    // Ignore repetitive words
-    const words = cleaned.split(/\s+/);
-    const uniqueWords = new Set(words);
-
-    if (uniqueWords.size <= 3 && words.length > 5) {
-      return true;
-    }
-
-    return false;
-  };
-
-  const cleanTranscript = (text: string): string => {
-    if (!text) return "";
-
-    let cleaned = text;
-
-    // Remove music tags
-    cleaned = cleaned.replace(/\[music\]/gi, "");
-
-    // Remove anything inside brackets
-    cleaned = cleaned.replace(/\[.*?\]/g, "");
-
-    // Remove subtitle arrows
-    cleaned = cleaned.replace(/>>/g, "");
-
-    // Remove repeated spaces
-    cleaned = cleaned.replace(/\s+/g, " ").trim();
-
-    // Remove repeated words
-    cleaned = cleaned.replace(/\b(\w+)( \1\b)+/gi, "$1");
-
-    // Remove duplicate sentence fragments
-    const parts = cleaned.split(". ");
-    const uniqueParts: string[] = [];
-
-    for (const part of parts) {
-      if (!uniqueParts.includes(part.trim())) {
-        uniqueParts.push(part.trim());
-      }
-    }
-
-    cleaned = uniqueParts.join(". ");
-
-    return cleaned.trim();
-  };
-
-  const startAnalysis = async (videoId: string) => {
-    if (analysisInProgress.current) return;
-
-    const finalTranscript = cleanTranscript(transcriptRef.current);
-
-    if (!finalTranscript || finalTranscript.length < 10) {
-      console.log("Transcript too short after stabilization");
+    // Lightweight pre-filter — zero API cost
+    const filterResult = preFilterTranscript(deduped);
+    if (!filterResult.pass) {
+      console.log(`[Content] Pre-filter blocked transcript: ${filterResult.reason}`);
+      analysisTriggered.current = false;
       return;
     }
 
-    console.log("Final stabilized transcript:", finalTranscript);
-
-    if (shouldIgnoreTranscript(finalTranscript)) {
-      console.log("Ignoring low-information transcript");
+    if (!portRef.current) {
+      console.warn("[Content] Port not established.");
+      analysisTriggered.current = false;
       return;
     }
 
-    analysisInProgress.current = true;
+    console.log(`[Content] Sending to background (${deduped.split(/\s+/).length} words): "${deduped.substring(0, 90)}…"`);
 
-    console.log("Starting AI analysis...");
-
-    const settings = (await chrome.storage.local.get(["geminiApiKey"])) as {
-      geminiApiKey?: string;
-    };
-
-    console.log("Stored Gemini Key:", settings.geminiApiKey);
-
-    if (!settings.geminiApiKey) {
-      console.warn("Gemini API key not found");
-      return;
+    try {
+      portRef.current.postMessage({
+        action: "VERIFY_TRANSCRIPT",
+        videoId,
+        transcript: deduped,
+      });
+    } catch (err) {
+      console.error("[Content] Port error sending verification request:", err);
+      analysisTriggered.current = false;
     }
-
-    abortControllerRef.current = new AbortController();
-
-    const gemini = new GeminiService(settings.geminiApiKey);
-
-    const result = await gemini.analyzeTranscript(
-      finalTranscript,
-      abortControllerRef.current.signal,
-    );
-
-    setActiveVideo((prev) =>
-      prev && prev.videoId === videoId
-        ? {
-            ...prev,
-            processed: true,
-            analysis: result,
-          }
-        : prev,
-    );
   };
 
+  // 3. Capture and stabilize transcripts from MutationObserver
   useEffect(() => {
-    // Start observing captions
     const observer = CaptionExtractor.observeCaptions((text) => {
-      if (!text) {
-        return;
-      }
+      if (!text || !activeVideo) return;
 
-      if (!transcriptRef.current.includes(text)) {
-        transcriptRef.current += " " + text;
-      }
+      // Ignore captions during swipe lock period
+      if (swipeLockRef.current) return;
 
-      // if (shouldIgnoreTranscript(text)) {
-      //   console.log("Ignoring music or low-information content early");
-      //   return;
-      // }
+      // Deduplicate individual incoming segments
+      const normalised = text.trim();
+      if (!normalised || seenSegmentsRef.current.has(normalised)) return;
+      seenSegmentsRef.current.add(normalised);
+      transcriptRef.current += " " + normalised;
 
+      // Trigger verification once transcript reaches 40 words, with debounce
+      const wordCount = transcriptRef.current.split(/\s+/).length;
       if (
-        !analysisInProgress.current &&
-        transcriptRef.current.split(" ").length > 80
+        !analysisTriggered.current &&
+        !activeVideo.processed &&
+        wordCount >= 40
       ) {
-        analysisInProgress.current = true;
+        analysisTriggered.current = true;
 
-        console.log("Transcript stabilized");
-        console.log("Starting AI analysis...");
-
-        if (activeVideo?.videoId) {
-          startAnalysis(activeVideo.videoId);
-        }
+        // Debounce: wait 1.5 s for caption stream to settle before firing
+        if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+        debounceTimerRef.current = setTimeout(() => {
+          console.log(`[Content] Transcript stabilized with ${transcriptRef.current.split(/\s+/).length} words.`);
+          triggerBackgroundVerification(activeVideo.videoId);
+          debounceTimerRef.current = null;
+        }, 1500);
       }
     });
 
     return () => observer.disconnect();
   }, [activeVideo]);
 
-  if (!activeVideo || !activeVideo.analysis) return null;
-  console.log("Rendering overlay:", activeVideo.analysis);
+  if (!activeVideo) return null;
 
-  return (
-    <CredibilityOverlay
-      analysis={activeVideo.analysis}
-      onClose={() => setActiveVideo(null)}
-    />
-  );
+  // Render elegant loading/error states in the Shadow DOM overlay
+  const renderStatusView = () => {
+    if (activeVideo.status === "loading") {
+      return (
+        <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-full bg-slate-950/85 backdrop-blur-lg border border-slate-800/80 shadow-lg text-slate-300 animate-pulse text-xs select-none">
+          <Loader2 size={14} className="animate-spin text-blue-400" />
+          <span className="font-semibold uppercase tracking-wider">CredLens: Analyzing...</span>
+        </div>
+      );
+    }
+
+    if (activeVideo.status === "error") {
+      return (
+        <div className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-full bg-rose-950/85 backdrop-blur-lg border border-rose-800/50 shadow-lg text-rose-200 text-xs select-none">
+          <AlertCircle size={14} className="text-rose-400 shrink-0" />
+          <div className="flex flex-col">
+            <span className="font-bold uppercase tracking-wider text-[8px] opacity-75 leading-none">CredLens Error</span>
+            <span className="font-medium mt-0.5 leading-tight">Click extension to setup Key</span>
+          </div>
+          <button
+            onClick={() => setActiveVideo(null)}
+            className="ml-1 p-0.5 hover:bg-rose-900/50 rounded-full transition-colors"
+          >
+            <X size={10} />
+          </button>
+        </div>
+      );
+    }
+
+    if (activeVideo.status === "completed" && activeVideo.analysis) {
+      return (
+        <CredibilityOverlay
+          analysis={activeVideo.analysis}
+          onClose={() => setActiveVideo(null)}
+        />
+      );
+    }
+
+    return null;
+  };
+
+  return renderStatusView();
 };
 
-// Initialize Shadow DOM
+// Advanced styling syncer: Sync Vite extension stylesheet rules into isolated Shadow DOM
+const syncStylesIntoShadow = (shadowRoot: ShadowRoot) => {
+  const syncNode = (node: Node) => {
+    if (node.nodeName === "LINK") {
+      const link = node as HTMLLinkElement;
+      if (link.rel === "stylesheet" && link.href.startsWith("chrome-extension://")) {
+        const clone = link.cloneNode(true) as HTMLLinkElement;
+        shadowRoot.appendChild(clone);
+      }
+    } else if (node.nodeName === "STYLE") {
+      const style = node as HTMLStyleElement;
+      const clone = style.cloneNode(true) as HTMLStyleElement;
+      shadowRoot.appendChild(clone);
+    }
+  };
+
+  // Sync existing stylesheets
+  document.querySelectorAll("style, link[rel='stylesheet']").forEach(syncNode);
+
+  // Sync dynamic stylesheet injections (e.g. CRXJS hot-reloading/updates)
+  const observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      mutation.addedNodes.forEach((node) => {
+        if (node.nodeName === "LINK" || node.nodeName === "STYLE") {
+          syncNode(node);
+        }
+      });
+    }
+  });
+
+  observer.observe(document.head, { childList: true });
+  return observer;
+};
+
+// Initialize Shadow DOM Container
 const init = () => {
-  console.log("CredLens extension injected");
+  if (document.getElementById("credlens-root")) return;
+
+  console.log("[Content] Initializing CredLens root container...");
   const container = document.createElement("div");
   container.id = "credlens-root";
   document.body.appendChild(container);
@@ -252,27 +290,32 @@ const init = () => {
   shadowWrapper.id = "credlens-shadow-wrapper";
   shadowRoot.appendChild(shadowWrapper);
 
-  // Inject styles into shadow DOM
+  // Inject root host styling
   const style = document.createElement("style");
-  // We'll need to fetch the injected CSS or use a small subset
-  // For now, let's use a basic style injection
   style.textContent = `
     #credlens-shadow-wrapper {
       position: fixed;
-      top: 20px;
-      right: 20px;
-      z-index: 999999;
+      top: 16px;
+      right: 16px;
+      z-index: 2147483647; /* Set to absolute max to float over video overlays */
       pointer-events: auto;
     }
   `;
   shadowRoot.appendChild(style);
 
-  // Create React root
+  // Establish live styling sync from document head to isolated Shadow DOM
+  const styleObserver = syncStylesIntoShadow(shadowRoot);
+
   const root = ReactDOM.createRoot(shadowWrapper);
   root.render(<YouTubeShortsDetector />);
+
+  // Cleanup on page teardown
+  window.addEventListener("unload", () => {
+    styleObserver.disconnect();
+  });
 };
 
-// Wait for body to be ready
+// Delay until document is interactive
 if (document.body) {
   init();
 } else {
