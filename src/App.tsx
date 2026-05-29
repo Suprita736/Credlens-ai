@@ -58,6 +58,11 @@ const App = () => {
       label: "Gemini 2.0 Flash AI",
       detail: "Soft correction & synthesis engine",
     },
+    {
+      icon: <Shield size={12} className="text-indigo-400" />,
+      label: "3-Tier Performance Cache",
+      detail: "In-memory + Chrome + IndexedDB L3",
+    },
   ];
 
   return (
@@ -72,7 +77,7 @@ const App = () => {
           <p className="text-[10px] text-slate-400 mt-0.5">YouTube Shorts Fact Verifier</p>
         </div>
         <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-blue-900/60 border border-blue-700/50 text-blue-300 font-bold uppercase tracking-wider shrink-0">
-          Phase 2
+          Phase 3
         </span>
       </div>
 
@@ -134,7 +139,7 @@ const App = () => {
           >
             <span className="flex items-center gap-1.5">
               <Info size={11} className="text-slate-500" />
-              Phase 2 Verification Features
+              Phase 3 Optimization Features
             </span>
             {showTips ? (
               <ChevronUp size={11} className="text-slate-500" />
@@ -169,8 +174,8 @@ const App = () => {
       {/* Footer */}
       <div className="px-5 pb-4 pt-2 border-t border-slate-900">
         <p className="text-[9px] text-slate-600 text-center leading-relaxed">
-          CredLens AI · Phase 2 · Verifying claims in YouTube Shorts using{" "}
-          Gemini 2.0 Flash, PubMed, Google News &amp; Fact Check APIs.
+          CredLens AI · Phase 3 · Verifying claims in YouTube Shorts with{" "}
+          high-performance 3-tier caching &amp; multi-factor scoring.
         </p>
       </div>
     </div>

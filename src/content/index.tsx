@@ -1,7 +1,10 @@
 import { useState, useEffect, useRef } from "react";
 import ReactDOM from "react-dom/client";
 import { CaptionExtractor } from "../utils/captionExtractor.ts";
-import { preFilterTranscript, deduplicateTranscript } from "../utils/transcriptFilter.ts";
+import {
+  preFilterTranscript,
+  deduplicateTranscript,
+} from "../utils/transcriptFilter.ts";
 import type { VideoState, BackgroundResponse } from "../types";
 import CredibilityOverlay from "../components/CredibilityOverlay.tsx";
 import { Loader2, AlertCircle, X } from "lucide-react";
@@ -9,13 +12,15 @@ import "../index.css";
 
 const YouTubeShortsDetector = () => {
   const [activeVideo, setActiveVideo] = useState<VideoState | null>(null);
-  const swipeLockRef = useRef(true);         // true = still in 3-s swipe cooldown
+  const swipeLockRef = useRef(true); // true = still in 3-s swipe cooldown
   const transcriptRef = useRef("");
   const seenSegmentsRef = useRef(new Set<string>()); // dedup individual caption segments
   const analysisTriggered = useRef(false);
   const debounceTimerRef = useRef<any>(null); // debounce rapid caption bursts
   const portRef = useRef<chrome.runtime.Port | null>(null);
-
+  const watchStartRef = useRef<number>(0);
+  const processedVideoRef = useRef<string | null>(null);
+  const reconnectingRef = useRef(false);
   // 1. Establish long-lived Port connection with Background Service Worker
   useEffect(() => {
     const connectPort = () => {
@@ -25,11 +30,14 @@ const YouTubeShortsDetector = () => {
 
       port.onMessage.addListener((message: BackgroundResponse) => {
         const { status, videoId, analysis, error } = message;
-        console.log(`[Content] Port Message: ${status} for video ${videoId}`, message);
+        console.log(
+          `[Content] Port Message: ${status} for video ${videoId}`,
+          message,
+        );
 
         setActiveVideo((prev) => {
           if (!prev || prev.videoId !== videoId) return prev;
-          
+
           return {
             ...prev,
             status,
@@ -44,9 +52,21 @@ const YouTubeShortsDetector = () => {
       });
 
       port.onDisconnect.addListener(() => {
-        console.warn("[Content] Background port disconnected. Reconnecting in 3s...");
+        console.warn("[Content] Background port disconnected.");
+
         portRef.current = null;
-        setTimeout(connectPort, 3000);
+
+        if (reconnectingRef.current) return;
+
+        reconnectingRef.current = true;
+
+        setTimeout(() => {
+          console.log("[Content] Reconnecting background port...");
+
+          connectPort();
+
+          reconnectingRef.current = false;
+        }, 3000);
       });
     };
 
@@ -66,7 +86,7 @@ const YouTubeShortsDetector = () => {
       if (url.includes("/shorts/")) {
         const videoId = url.split("/shorts/")[1].split("?")[0];
         console.log("[Content] Detected Shorts video:", videoId);
-        
+
         if (activeVideo?.videoId !== videoId) {
           resetAndStartNewVideo(videoId);
         }
@@ -84,6 +104,9 @@ const YouTubeShortsDetector = () => {
   }, [activeVideo]);
 
   const resetAndStartNewVideo = (videoId: string) => {
+    // Set watch time starting point
+    watchStartRef.current = Date.now();
+
     // Cancel any pending debounce
     if (debounceTimerRef.current) {
       clearTimeout(debounceTimerRef.current);
@@ -92,7 +115,9 @@ const YouTubeShortsDetector = () => {
 
     // Notify background worker to abort active fetches for old video
     if (activeVideo?.videoId && portRef.current) {
-      console.log(`[Content] Swiped away from ${activeVideo.videoId}. Requesting cancellation.`);
+      console.log(
+        `[Content] Swiped away from ${activeVideo.videoId}. Requesting cancellation.`,
+      );
       try {
         portRef.current.postMessage({
           action: "CANCEL_VERIFICATION",
@@ -109,7 +134,7 @@ const YouTubeShortsDetector = () => {
     analysisTriggered.current = false;
     swipeLockRef.current = true; // engage swipe lock
     CaptionExtractor.reset();
-
+    processedVideoRef.current = null;
     setActiveVideo({
       videoId,
       viewTime: 0,
@@ -131,11 +156,16 @@ const YouTubeShortsDetector = () => {
   const triggerBackgroundVerification = (videoId: string) => {
     // Deduplicate the raw buffer (fixes progressive caption double-append)
     const deduped = deduplicateTranscript(transcriptRef.current);
-
+    if (processedVideoRef.current === videoId) {
+      console.log("[Content] Video already analyzed.");
+      return;
+    }
     // Lightweight pre-filter — zero API cost
     const filterResult = preFilterTranscript(deduped);
     if (!filterResult.pass) {
-      console.log(`[Content] Pre-filter blocked transcript: ${filterResult.reason}`);
+      console.log(
+        `[Content] Pre-filter blocked transcript: ${filterResult.reason}`,
+      );
       analysisTriggered.current = false;
       return;
     }
@@ -146,7 +176,9 @@ const YouTubeShortsDetector = () => {
       return;
     }
 
-    console.log(`[Content] Sending to background (${deduped.split(/\s+/).length} words): "${deduped.substring(0, 90)}…"`);
+    console.log(
+      `[Content] Sending to background (${deduped.split(/\s+/).length} words): "${deduped.substring(0, 90)}…"`,
+    );
 
     try {
       portRef.current.postMessage({
@@ -154,6 +186,7 @@ const YouTubeShortsDetector = () => {
         videoId,
         transcript: deduped,
       });
+      processedVideoRef.current = videoId;
     } catch (err) {
       console.error("[Content] Port error sending verification request:", err);
       analysisTriggered.current = false;
@@ -174,22 +207,26 @@ const YouTubeShortsDetector = () => {
       seenSegmentsRef.current.add(normalised);
       transcriptRef.current += " " + normalised;
 
-      // Trigger verification once transcript reaches 40 words, with debounce
+      // Trigger verification once transcript reaches 40 words, with watch-time gate & debounce
       const wordCount = transcriptRef.current.split(/\s+/).length;
+      const elapsedWatchTime = Date.now() - watchStartRef.current;
       if (
         !analysisTriggered.current &&
         !activeVideo.processed &&
-        wordCount >= 40
+        wordCount >= 40 &&
+        elapsedWatchTime >= 3000
       ) {
         analysisTriggered.current = true;
 
-        // Debounce: wait 1.5 s for caption stream to settle before firing
+        // Debounce: wait 2.0 s for caption stream to settle before firing
         if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = setTimeout(() => {
-          console.log(`[Content] Transcript stabilized with ${transcriptRef.current.split(/\s+/).length} words.`);
+          console.log(
+            `[Content] Transcript stabilized with ${transcriptRef.current.split(/\s+/).length} words.`,
+          );
           triggerBackgroundVerification(activeVideo.videoId);
           debounceTimerRef.current = null;
-        }, 1500);
+        }, 2000);
       }
     });
 
@@ -204,7 +241,9 @@ const YouTubeShortsDetector = () => {
       return (
         <div className="flex items-center gap-2 px-3.5 py-2.5 rounded-full bg-slate-950/85 backdrop-blur-lg border border-slate-800/80 shadow-lg text-slate-300 animate-pulse text-xs select-none">
           <Loader2 size={14} className="animate-spin text-blue-400" />
-          <span className="font-semibold uppercase tracking-wider">CredLens: Analyzing...</span>
+          <span className="font-semibold uppercase tracking-wider">
+            CredLens: Analyzing...
+          </span>
         </div>
       );
     }
@@ -214,8 +253,12 @@ const YouTubeShortsDetector = () => {
         <div className="flex items-center gap-2.5 px-3.5 py-2.5 rounded-full bg-rose-950/85 backdrop-blur-lg border border-rose-800/50 shadow-lg text-rose-200 text-xs select-none">
           <AlertCircle size={14} className="text-rose-400 shrink-0" />
           <div className="flex flex-col">
-            <span className="font-bold uppercase tracking-wider text-[8px] opacity-75 leading-none">CredLens Error</span>
-            <span className="font-medium mt-0.5 leading-tight">Click extension to setup Key</span>
+            <span className="font-bold uppercase tracking-wider text-[8px] opacity-75 leading-none">
+              CredLens Error
+            </span>
+            <span className="font-medium mt-0.5 leading-tight">
+              Click extension to setup Key
+            </span>
           </div>
           <button
             onClick={() => setActiveVideo(null)}
@@ -247,7 +290,10 @@ const syncStylesIntoShadow = (shadowRoot: ShadowRoot) => {
   const syncNode = (node: Node) => {
     if (node.nodeName === "LINK") {
       const link = node as HTMLLinkElement;
-      if (link.rel === "stylesheet" && link.href.startsWith("chrome-extension://")) {
+      if (
+        link.rel === "stylesheet" &&
+        link.href.startsWith("chrome-extension://")
+      ) {
         const clone = link.cloneNode(true) as HTMLLinkElement;
         shadowRoot.appendChild(clone);
       }

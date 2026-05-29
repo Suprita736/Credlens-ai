@@ -65,6 +65,11 @@ export interface ClaimAnalysis {
   factCheck?: FactCheckResult | null;
   healthResearch?: HealthVerificationResult | null;
   newsVerification?: NewsVerificationResult | null;
+
+  // Confidence scoring breakdown
+  scientificSupport?: 'Strong' | 'Moderate' | 'Weak' | 'None' | 'N/A';
+  manipulationRisk?: 'High' | 'Moderate' | 'Low';
+  evidenceStrength?: 'Strong' | 'Moderate' | 'Weak';
 }
 
 export interface VideoState {
@@ -91,3 +96,12 @@ export interface BackgroundResponse {
   analysis?: ClaimAnalysis;
   error?: string;
 }
+
+export interface EvidenceBundle {
+  factCheck?: FactCheckResult | null;
+  healthResearch?: ResearchArticle[];
+  newsArticles?: NewsArticle[];
+}
+
+export type { AIProvider } from "./aiProvider";
+

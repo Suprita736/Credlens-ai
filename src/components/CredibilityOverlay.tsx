@@ -213,6 +213,45 @@ const CredibilityOverlay: React.FC<Props> = ({ analysis, onClose }) => {
             </div>
           </div>
 
+          {/* Confidence Breakdown Metrics */}
+          {(!analysis.isSatire && (analysis.scientificSupport || analysis.manipulationRisk || analysis.evidenceStrength)) && (
+            <div className="flex items-center justify-between gap-1.5 mb-4 p-2.5 rounded-xl bg-slate-900/40 border border-slate-900">
+              {analysis.scientificSupport && analysis.scientificSupport !== "N/A" && (
+                <div className="flex-1 flex flex-col items-center border-r border-slate-900/80 last:border-0">
+                  <span className="text-[8px] uppercase tracking-wider text-slate-500 font-bold leading-none">Science</span>
+                  <span className={`text-[10px] font-extrabold mt-1 leading-none ${
+                    analysis.scientificSupport === "Strong" ? "text-emerald-400" :
+                    analysis.scientificSupport === "Moderate" ? "text-amber-400" : "text-rose-400"
+                  }`}>
+                    {analysis.scientificSupport}
+                  </span>
+                </div>
+              )}
+              {analysis.evidenceStrength && (
+                <div className="flex-1 flex flex-col items-center border-r border-slate-900/80 last:border-0">
+                  <span className="text-[8px] uppercase tracking-wider text-slate-500 font-bold leading-none">Evidence</span>
+                  <span className={`text-[10px] font-extrabold mt-1 leading-none ${
+                    analysis.evidenceStrength === "Strong" ? "text-emerald-400" :
+                    analysis.evidenceStrength === "Moderate" ? "text-amber-400" : "text-rose-400"
+                  }`}>
+                    {analysis.evidenceStrength}
+                  </span>
+                </div>
+              )}
+              {analysis.manipulationRisk && (
+                <div className="flex-1 flex flex-col items-center border-r border-slate-900/80 last:border-0">
+                  <span className="text-[8px] uppercase tracking-wider text-slate-500 font-bold leading-none">Manip. Risk</span>
+                  <span className={`text-[10px] font-extrabold mt-1 leading-none ${
+                    analysis.manipulationRisk === "Low" ? "text-emerald-400" :
+                    analysis.manipulationRisk === "Moderate" ? "text-amber-400" : "text-rose-400"
+                  }`}>
+                    {analysis.manipulationRisk}
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Soft Correction Explanation */}
           <div className="mb-4 space-y-2">
             <div>

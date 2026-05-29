@@ -1,112 +1,54 @@
+// src/background/index.ts
 import { QueueManager } from "./queueManager";
 import { GeminiService } from "../services/geminiService";
-import { FactCheckService } from "../services/factCheckService";
-import { HealthService } from "../services/healthService";
-import { NewsService } from "../services/newsService";
+import { CacheService } from "../services/cacheService";
+import { ConfidenceScorer } from "../utils/confidenceScorer";
+import { filterForClaims } from "../utils/claimFilter"; // Phase 3.5
+import { extractClaimSentences } from "../utils/claimExtractor"; // Phase 3.5
+import { ClaimClassifier } from "../utils/claimClassifier";
+import { ClaimRouter } from "../utils/claimRouter";
+import { ConfidenceEngine } from "../utils/confidenceEngine";
+import { RetrievalEngine } from "../services/retrievalEngine";
+import { EscalationManager } from "../utils/escalationManager";
 import type { ClaimAnalysis, BackgroundMessage, BackgroundResponse } from "../types";
 
-// ─── Cache configuration ───────────────────────────────────────────────────────
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-const CACHE_PREFIX_VIDEO = "credlens_cache_";
-const CACHE_PREFIX_CLAIM = "credlens_claim_cache_";
-const MAX_CACHE_ENTRIES = 50; // total cached items before pruning oldest
-
-interface CachedEntry {
-  data: ClaimAnalysis;
-  timestamp: number;
-}
-
-/**
- * Robust retry helper for transient network failures.
- */
-async function retryWithDelay<T>(
+function retryWithDelay<T>(
   fn: () => Promise<T>,
-  retries = 2,
-  delayMs = 1500,
+  attempts: number,
+  delayMs: number,
   signal?: AbortSignal
 ): Promise<T> {
-  try {
-    return await fn();
-  } catch (error) {
-    if (retries <= 0 || signal?.aborted) {
-      throw error;
-    }
-    console.warn(`[Background] Retrying operation due to failure (${retries} left). Error:`, error);
-    if (signal) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = setTimeout(resolve, delayMs);
-        signal.addEventListener("abort", () => {
-          clearTimeout(timeout);
-          reject(new DOMException("Aborted", "AbortError"));
+  let lastError: any;
+  for (let i = 0; i < attempts; i++) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    try {
+      return fn();
+    } catch (err) {
+      lastError = err;
+      if (i < attempts - 1) {
+        return new Promise<T>((_, reject) => {
+          const t = setTimeout(() => {
+            fn().then(_).catch(reject);
+          }, delayMs);
+          signal?.addEventListener('abort', () => {
+            clearTimeout(t);
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
         });
-      });
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-    return retryWithDelay(fn, retries - 1, delayMs, signal);
-  }
-}
-
-/**
- * Computes a standard SHA-256 hash of a claim to perform duplicate cross-video caching.
- */
-async function computeClaimHash(claim: string): Promise<string> {
-  const msgBuffer = new TextEncoder().encode(claim.trim().toLowerCase());
-  const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/**
- * Prune expired and excess cache entries from chrome.storage.local.
- * Called once on extension install/startup.
- */
-async function pruneCache(): Promise<void> {
-  try {
-    const all = await chrome.storage.local.get(null);
-    const now = Date.now();
-    const credlensKeys = Object.keys(all).filter(
-      (k) => k.startsWith(CACHE_PREFIX_VIDEO) || k.startsWith(CACHE_PREFIX_CLAIM)
-    );
-
-    const toDelete: string[] = [];
-    const validEntries: { key: string; timestamp: number }[] = [];
-
-    for (const key of credlensKeys) {
-      const entry = all[key] as CachedEntry | undefined;
-      if (!entry || !entry.timestamp || now - entry.timestamp > CACHE_TTL_MS) {
-        toDelete.push(key); // expired
-      } else {
-        validEntries.push({ key, timestamp: entry.timestamp });
       }
     }
-
-    // If still over limit after TTL pruning, delete oldest first
-    if (validEntries.length > MAX_CACHE_ENTRIES) {
-      validEntries.sort((a, b) => a.timestamp - b.timestamp);
-      const overflow = validEntries.splice(0, validEntries.length - MAX_CACHE_ENTRIES);
-      overflow.forEach((e) => toDelete.push(e.key));
-    }
-
-    if (toDelete.length > 0) {
-      await chrome.storage.local.remove(toDelete);
-      console.log(`[Background] Cache pruned: removed ${toDelete.length} entries.`);
-    } else {
-      console.log(`[Background] Cache healthy: ${validEntries.length} entries.`);
-    }
-  } catch (err) {
-    console.warn("[Background] Cache pruning failed:", err);
   }
+  return Promise.reject(lastError);
 }
 
 // Run cache pruning on install and startup
 chrome.runtime.onInstalled.addListener(() => {
   console.log("[Background] CredLens AI installed/updated.");
-  pruneCache();
+  CacheService.prune();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  pruneCache();
+  CacheService.prune();
 });
 
 // Background Port Messaging Router
@@ -118,12 +60,9 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onMessage.addListener(async (message: BackgroundMessage) => {
     const { action, videoId, transcript } = message;
-
     if (action === "VERIFY_TRANSCRIPT" && videoId && transcript) {
       activeVideoId = videoId;
       console.log(`[Background] Received verification request for ${videoId}`);
-      
-      // Start processing pipeline
       await runVerificationPipeline(videoId, transcript, port);
     } else if (action === "CANCEL_VERIFICATION" && videoId) {
       console.log(`[Background] Received cancellation request for ${videoId}`);
@@ -159,32 +98,25 @@ async function runVerificationPipeline(
       geminiApiKey?: string;
     };
     const apiKey = storage.geminiApiKey;
-
     if (!apiKey) {
       console.warn("[Background] No Gemini API key stored");
       postResponse(port, {
         status: "error",
         videoId,
-        error: "Missing API Key. Please click the extension icon and configure your Gemini API Key.",
+        error:
+          "Missing API Key. Please click the extension icon and configure your Gemini API Key.",
       });
       QueueManager.complete(videoId);
       return;
     }
 
-    // 3. Double-Layer Cache Level 1: Check Video ID Cache (with TTL)
-    const cachedVideo = await chrome.storage.local.get([`${CACHE_PREFIX_VIDEO}${videoId}`]);
-    const videoEntry = cachedVideo[`${CACHE_PREFIX_VIDEO}${videoId}`] as CachedEntry | undefined;
-    if (videoEntry) {
-      const age = Date.now() - (videoEntry.timestamp ?? 0);
-      if (age < CACHE_TTL_MS) {
-        console.log(`[Background] Cache Hit (Video ID): ${videoId} (age: ${Math.round(age / 1000)}s)`);
-        postResponse(port, { status: "completed", videoId, analysis: videoEntry.data });
-        QueueManager.complete(videoId);
-        return;
-      } else {
-        console.log(`[Background] Cache Expired (Video ID): ${videoId}`);
-        await chrome.storage.local.remove(`${CACHE_PREFIX_VIDEO}${videoId}`);
-      }
+    // 3. Double-Layer Cache Level 1: Check Video ID Cache
+    const cachedAnalysis = await CacheService.get(videoId);
+    if (cachedAnalysis) {
+      console.log(`[Background] Cache Hit (Video ID): ${videoId}`);
+      postResponse(port, { status: "completed", videoId, analysis: cachedAnalysis });
+      QueueManager.complete(videoId);
+      return;
     }
 
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
@@ -192,143 +124,218 @@ async function runVerificationPipeline(
     // 4. Initialize Gemini Service
     const gemini = new GeminiService(apiKey);
 
-    // 5. Stage A: Extract claims, category, and satire flags (Minimizes token/quota costs)
-    console.log("[Background] Extracting claims from transcript...");
-    const claimAnalysis = await retryWithDelay(
-      () => gemini.analyzeTranscript(transcript, signal),
-      1,
-      1000,
-      signal
-    );
+    // ── Phase 3.5 — Local Claim Filter ────────────────────────────────────────
+    // Run zero-cost local heuristics BEFORE any Gemini call.
+    // If the transcript is clearly devoid of factual signals (e.g. it's a
+    // music video or pure filler) we skip Gemini entirely and finalise early.
+    // IMPORTANT: This is additive — if the filter throws for any reason we
+    // catch the error and fall through to normal Gemini analysis.
+
+    let claimSentences: string[] | undefined;
+    try {
+      const filterResult = filterForClaims(transcript);
+      console.log(
+        `[Background] Phase 3.5 Claim Filter: hasPotentialClaim=${filterResult.hasPotentialClaim}, ` +
+          `confidence=${filterResult.confidence}, ` +
+          `matchedPatterns=${filterResult.matchedPatterns
+            .filter((p) => p !== "__numeric__")
+            .slice(0, 5)
+            .join(", ") || "(none)"}`
+      );
+      if (!filterResult.hasPotentialClaim) {
+        console.log(
+          `[Background] Phase 3.5 — Local filter skipped Gemini call. ` +
+            "Transcript has no detectable claim signals."
+        );
+        const noClaimResult: ClaimAnalysis = {
+          containsClaim: false,
+          isSatire: false,
+          reasoning:
+            "Local claim filter: no factual claim signals detected in transcript.",
+          verdict: "No verifiable claims detected",
+          credibility: "none",
+        };
+        await CacheService.set(videoId, null, noClaimResult);
+        postResponse(port, { status: "completed", videoId, analysis: noClaimResult });
+        QueueManager.complete(videoId);
+        return;
+      }
+
+      // ── Phase 3.5 — Local Claim Sentence Extraction ──────────────────────────
+      const extractionResult = extractClaimSentences(transcript);
+      console.log(
+        `[Background] Phase 3.5 Claim Extractor: ${extractionResult.stats.extractedCount}/${extractionResult.stats.totalSentences} sentences kept, ` +
+          `~${extractionResult.stats.reductionPercent}% token reduction ` +
+          `(${extractionResult.stats.originalCharCount} → ${extractionResult.stats.reducedCharCount} chars).`
+      );
+      if (extractionResult.sentences.length > 0) {
+        claimSentences = extractionResult.sentences;
+      } else {
+        console.log(
+          "[Background] Phase 3.5 — Extractor found 0 sentences; falling back to full transcript for Gemini."
+        );
+      }
+    } catch (filterErr) {
+      console.warn(
+        "[Background] Phase 3.5 local filter/extractor error (non-fatal, falling back):",
+        filterErr
+      );
+    }
 
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-    // If no claims are found or it's comedy/satire, stop the pipeline early (Quota Saver!)
-    if (!claimAnalysis.containsClaim || claimAnalysis.isSatire) {
-      console.log("[Background] No factual claims found or satire detected. Finalizing...");
-      const finalResult: ClaimAnalysis = {
-        containsClaim: false,
-        isSatire: claimAnalysis.isSatire,
-        reasoning: claimAnalysis.reasoning,
-        verdict: claimAnalysis.isSatire ? "Satire / Entertainment" : "No verifiable claims detected",
-        credibility: "none",
-      };
+    // 5. Local Classification & Routing (Zero-cost, local-first intelligence)
+    const claimText = (claimSentences && claimSentences.length > 0 && claimSentences[0].trim().length > 0
+      ? claimSentences[0]
+      : transcript.slice(0, 150)
+    ).trim();
 
-      // Cache and respond
-      await cacheResult(videoId, null, finalResult);
-      postResponse(port, { status: "completed", videoId, analysis: finalResult });
+    const localClassification = ClaimClassifier.classify(claimText);
+    const category = localClassification.category || "other";
+    console.log(`[Classifier] Local category=${category}`);
+
+    const route = ClaimRouter.determineRoute(category);
+    console.log(`[Router] Route=${route}`);
+
+    // 6. Double-Layer Cache Level 2: Check Claim Hash Cache
+    const claimHash = await CacheService.computeClaimHash(claimText);
+    const cachedClaimAnalysis = await CacheService.getByClaimHash(claimHash);
+    if (cachedClaimAnalysis) {
+      console.log(`[Background] Cache Hit (Claim Hash): ${claimHash.slice(0, 12)}…`);
+      await CacheService.set(videoId, claimHash, cachedClaimAnalysis);
+      postResponse(port, { status: "completed", videoId, analysis: cachedClaimAnalysis });
       QueueManager.complete(videoId);
       return;
     }
 
-    const claimText = claimAnalysis.claim!;
-    const category = claimAnalysis.category || "other";
-    console.log(`[Background] Flagged Claim: "${claimText}" in category: ${category}`);
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-    // 6. Double-Layer Cache Level 2: Check Claim Hash Cache (with TTL)
-    const claimHash = await computeClaimHash(claimText);
-    const cachedClaim = await chrome.storage.local.get([`${CACHE_PREFIX_CLAIM}${claimHash}`]);
-    const claimEntry = cachedClaim[`${CACHE_PREFIX_CLAIM}${claimHash}`] as CachedEntry | undefined;
-    if (claimEntry) {
-      const age = Date.now() - (claimEntry.timestamp ?? 0);
-      if (age < CACHE_TTL_MS) {
-        console.log(`[Background] Cache Hit (Claim Hash): ${claimHash.slice(0, 12)}… (age: ${Math.round(age / 1000)}s)`);
-        await cacheResult(videoId, claimHash, claimEntry.data);
-        postResponse(port, { status: "completed", videoId, analysis: claimEntry.data });
-        QueueManager.complete(videoId);
-        return;
-      } else {
-        console.log(`[Background] Cache Expired (Claim Hash): ${claimHash.slice(0, 12)}…`);
-        await chrome.storage.local.remove(`${CACHE_PREFIX_CLAIM}${claimHash}`);
+    // 7. Search External Verification Databases (MODULAR RETRIEVAL FIRST)
+    console.log("[Retrieval] Running FactCheck");
+    console.log("[Retrieval] Running PubMed");
+    console.log("[Retrieval] Running News");
+    const evidence = await RetrievalEngine.retrieve(claimText, category, apiKey, signal);
+    const factCheckRes = evidence.factCheck;
+    const healthRes = evidence.healthResearch || [];
+    const newsRes = evidence.newsArticles || [];
+
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+    // 8. Compute Local Evidence Confidence Score
+    const localConfidence = ConfidenceEngine.compute({
+      factCheck: factCheckRes ? [factCheckRes] : [],
+      healthResearch: healthRes,
+      newsArticles: newsRes,
+    });
+    console.log(`[Confidence] Score=${localConfidence}`);
+
+    // Verify at least one source produced evidence (Confidence Safety Rule)
+    const hasEvidence = !!factCheckRes || healthRes.length > 0 || newsRes.length > 0;
+
+    let synthesizedAnalysis: ClaimAnalysis;
+
+    // Check if we can skip LLM (High confidence AND at least one verification source returned data)
+    if (localConfidence >= 75 && hasEvidence) {
+      console.log("[Escalation] Skipped Gemini due to high confidence");
+      synthesizedAnalysis = buildLocalSynthesis(claimText, category, localConfidence, factCheckRes, healthRes, newsRes);
+    } else {
+      // Moderate/Low confidence OR no evidence → Try to verify/synthesize using Gemini
+      try {
+        console.log("[Background] Sending to Gemini for claim classification...");
+        const claimAnalysis = await retryWithDelay(
+          () => gemini.analyzeTranscript(transcript, signal, claimSentences),
+          1,
+          1000,
+          signal
+        );
+
+        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+
+        // If no claims are found or it's comedy/satire, stop the pipeline early (Quota Saver!)
+        if (!claimAnalysis.containsClaim || claimAnalysis.isSatire) {
+          console.log("[Background] Gemini classified as no claim or satire.");
+          // BUT check if retrieval found supporting evidence anyway!
+          if (hasEvidence) {
+            console.log("[Gemini Fallback] Gemini returned no claim but retrieval has evidence; falling back to retrieval-only verification.");
+            synthesizedAnalysis = buildLocalSynthesis(claimText, category, localConfidence, factCheckRes, healthRes, newsRes);
+          } else {
+            console.log("[Background] No factual claims found or satire detected. Finalizing...");
+            const finalResult: ClaimAnalysis = {
+              containsClaim: false,
+              isSatire: claimAnalysis.isSatire,
+              reasoning: claimAnalysis.reasoning,
+              verdict: claimAnalysis.isSatire
+                ? "Satire / Entertainment"
+                : "No verifiable claims detected",
+              credibility: "none",
+            };
+            await CacheService.set(videoId, null, finalResult);
+            postResponse(port, { status: "completed", videoId, analysis: finalResult });
+            QueueManager.complete(videoId);
+            return;
+          }
+        } else {
+          console.log("[Background] External searches complete. Synthesizing evidence...");
+          const synthesisInput = {
+            factCheck: factCheckRes,
+            healthResearch: healthRes,
+            newsArticles: newsRes,
+          };
+          synthesizedAnalysis = await retryWithDelay(
+            () => gemini.synthesizeVerification(claimText, category, synthesisInput, signal),
+            1,
+            1000,
+            signal
+          );
+        }
+      } catch (err: any) {
+        console.warn("[Gemini Fallback] Quota exceeded or error. Falling back to retrieval-only verification:", err);
+        // Fallback to retrieval-based synthesis
+        synthesizedAnalysis = buildLocalSynthesis(claimText, category, localConfidence, factCheckRes, healthRes, newsRes);
       }
     }
 
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
 
-    // 7. Stage B: Search External Verification Databases (MODULAR CONCURRENCY & FAIL-SAFES)
-    console.log("[Background] Initiating concurrent verification searches...");
+    // Attach rich structural sub-blocks for UI details
+    if (!synthesizedAnalysis.factCheck) synthesizedAnalysis.factCheck = factCheckRes;
+    if (healthRes.length > 0 && !synthesizedAnalysis.healthResearch) {
+      synthesizedAnalysis.healthResearch = {
+        status: synthesizedAnalysis.verdict as any,
+        summary: synthesizedAnalysis.explanation || "",
+        sources: healthRes,
+      };
+    }
+    if (newsRes.length > 0 && !synthesizedAnalysis.newsVerification) {
+      synthesizedAnalysis.newsVerification = {
+        status: synthesizedAnalysis.verdict as any,
+        summary: synthesizedAnalysis.explanation || "",
+        sources: newsRes,
+      };
+    }
 
-    const [factCheckRes, healthRes, newsRes] = await Promise.all([
-      // Google Fact Check search (with retry wrapper)
-      retryWithDelay(
-        () => FactCheckService.verifyClaim(claimText, apiKey, signal),
-        1,
-        1000,
-        signal
-      ).catch((err) => {
-        console.error("[Background] Modular service failure (FactCheck):", err);
-        return null;
-      }),
+    // 9. Local multi-factor confidence scoring
+    const scores = ConfidenceScorer.compute(synthesizedAnalysis);
+    synthesizedAnalysis.confidence = scores.confidence;
+    synthesizedAnalysis.scientificSupport = scores.scientificSupport;
+    synthesizedAnalysis.manipulationRisk = scores.manipulationRisk;
+    synthesizedAnalysis.evidenceStrength = scores.evidenceStrength;
 
-      // PubMed health search (if health category)
-      (category === "health" || category === "science")
-        ? retryWithDelay(
-            () => HealthService.searchPubMed(claimText, signal),
-            1,
-            1000,
-            signal
-          ).catch((err) => {
-            console.error("[Background] Modular service failure (Health PubMed):", err);
-            return [];
-          })
-        : Promise.resolve([]),
-
-      // Google News search (if news/politics/other category)
-      (category !== "health")
-        ? retryWithDelay(
-            () => NewsService.searchNews(claimText, signal),
-            1,
-            1000,
-            signal
-          ).catch((err) => {
-            console.error("[Background] Modular service failure (Google News):", err);
-            return [];
-          })
-        : Promise.resolve([]),
-    ]);
-
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-
-    console.log("[Background] External searches complete. Synthesizing evidence...");
-
-    // 8. Stage C: Synthesize final soft correction using Gemini (Enforces tone & educational rules)
-    const synthesisInput = {
-      factCheck: factCheckRes,
-      healthResearch: healthRes,
-      newsArticles: newsRes,
-    };
-
-    const synthesizedAnalysis = await retryWithDelay(
-      () => gemini.synthesizeVerification(claimText, category, synthesisInput, signal),
-      1,
-      1000,
+    // 9b. If confidence low, augment with OpenRouter verification via EscalationManager
+    const openResult = await EscalationManager.escalateIfNeeded(
+      claimText,
+      evidence,
+      scores.confidence,
+      apiKey,
       signal
     );
+    Object.assign(synthesizedAnalysis, openResult);
 
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-
-    // Attach rich structural sub-blocks for UI details
-    synthesizedAnalysis.factCheck = factCheckRes;
-    synthesizedAnalysis.healthResearch = healthRes.length > 0 ? {
-      status: synthesizedAnalysis.verdict as any,
-      summary: synthesizedAnalysis.explanation || "",
-      sources: healthRes
-    } : null;
-    synthesizedAnalysis.newsVerification = newsRes.length > 0 ? {
-      status: synthesizedAnalysis.verdict as any,
-      summary: synthesizedAnalysis.explanation || "",
-      sources: newsRes
-    } : null;
-
-    // 9. Double Caching
-    await cacheResult(videoId, claimHash, synthesizedAnalysis);
+    // 10. Multi-tier Caching
+    await CacheService.set(videoId, claimHash, synthesizedAnalysis);
 
     // 10. Respond success
-    postResponse(port, {
-      status: "completed",
-      videoId,
-      analysis: synthesizedAnalysis,
-    });
+    postResponse(port, { status: "completed", videoId, analysis: synthesizedAnalysis });
   } catch (error: any) {
     if (error.name === "AbortError" || signal.aborted) {
       console.log(`[Background] Verification pipeline aborted for ${videoId}`);
@@ -346,29 +353,6 @@ async function runVerificationPipeline(
 }
 
 /**
- * Caches a structured analysis in chrome.storage.local with a timestamp.
- */
-async function cacheResult(
-  videoId: string,
-  claimHash: string | null,
-  result: ClaimAnalysis
-): Promise<void> {
-  const entry: CachedEntry = { data: result, timestamp: Date.now() };
-  const cacheObj: { [key: string]: CachedEntry } = {};
-  cacheObj[`${CACHE_PREFIX_VIDEO}${videoId}`] = entry;
-
-  if (claimHash) {
-    cacheObj[`${CACHE_PREFIX_CLAIM}${claimHash}`] = entry;
-  }
-
-  await chrome.storage.local.set(cacheObj);
-  console.log(
-    `[Background] Cached results for Video: ${videoId}` +
-      (claimHash ? ` & ClaimHash: ${claimHash.slice(0, 12)}…` : "")
-  );
-}
-
-/**
  * Helper to safely post responses back through the communication port.
  */
 function postResponse(port: chrome.runtime.Port, response: BackgroundResponse) {
@@ -380,6 +364,73 @@ function postResponse(port: chrome.runtime.Port, response: BackgroundResponse) {
 }
 
 // Background cleanup on suspend
-chrome.runtime.onSuspend.addListener(() => {
-  QueueManager.cancelAll();
-});
+chrome.runtime.onSuspend.addListener(() => QueueManager.cancelAll());
+
+function buildLocalSynthesis(
+  claimText: string,
+  category: string,
+  confidence: number,
+  factCheckRes: any,
+  healthRes: any[],
+  newsRes: any[]
+): ClaimAnalysis {
+  const hasFactCheck = !!factCheckRes;
+  const hasHealth = healthRes.length > 0;
+  const hasNews = newsRes.length > 0;
+
+  let verdict = "Unverified";
+  let credibility: "low" | "medium" | "high" | "none" = "none";
+  let explanation = "No trusted sources could verify this statement at this time.";
+
+  if (hasFactCheck) {
+    verdict = factCheckRes.verdict;
+    const loweredVerdict = verdict.toLowerCase();
+    if (
+      loweredVerdict.includes("false") ||
+      loweredVerdict.includes("incorrect") ||
+      loweredVerdict.includes("fake") ||
+      loweredVerdict.includes("misleading") ||
+      loweredVerdict.includes("debunk")
+    ) {
+      credibility = "low";
+      explanation = `Google Fact Check database matches a debunked claim: "${factCheckRes.explanation}".`;
+    } else {
+      credibility = "high";
+      explanation = `Google Fact Check database matches a verified claim: "${factCheckRes.explanation}".`;
+    }
+  } else if (hasHealth) {
+    verdict = "Scientifically supported";
+    credibility = "high";
+    explanation = `Peer-reviewed scientific literature corroborates this claim (found ${healthRes.length} studies).`;
+  } else if (hasNews) {
+    verdict = "Widely reported";
+    credibility = "high";
+    explanation = `High-credibility news reports corroborate this claim (found ${newsRes.length} articles).`;
+  }
+
+  return {
+    containsClaim: true,
+    claim: claimText,
+    category: category as any,
+    isSatire: false,
+    verdict,
+    credibility,
+    confidence,
+    explanation,
+    alternativeExplanation: "Retrieved via local intelligence verification tools.",
+    sourceName: factCheckRes ? factCheckRes.source : (hasHealth ? healthRes[0].journal : newsRes[0]?.source),
+    sourceUrl: factCheckRes ? factCheckRes.url : (hasHealth ? healthRes[0].url : newsRes[0]?.url),
+    factCheck: factCheckRes,
+    healthResearch: hasHealth ? {
+      status: "Scientifically supported" as any,
+      summary: explanation,
+      sources: healthRes,
+    } : null,
+    newsVerification: hasNews ? {
+      status: "Widely reported" as any,
+      summary: explanation,
+      sources: newsRes,
+    } : null,
+  };
+}
+

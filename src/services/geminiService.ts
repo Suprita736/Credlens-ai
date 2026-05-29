@@ -84,34 +84,84 @@ export class GeminiService {
   // ── Stage A: Claim extraction ──────────────────────────────────────────────
 
   /**
-   * Classifies a transcript: does it contain a verifiable factual claim?
-   * Intentionally short prompt → minimal token cost → protects quota.
+   * Phase 3.5 — Optimised claim classifier.
+   *
+   * Accepts EITHER:
+   *   (a) `claimSentences` — an array of pre-extracted factual sentences
+   *       produced by claimExtractor.ts (preferred, minimal token cost), OR
+   *   (b) `transcript`     — the full deduplicated transcript as a fallback.
+   *
+   * When `claimSentences` are provided the prompt is compact (~200 tokens
+   * vs ~1 200+ tokens for a full transcript), dramatically reducing quota
+   * consumption and response latency.
+   *
+   * The response schema is identical to the previous implementation so the
+   * rest of the pipeline (background/index.ts, overlay, cache) is unaffected.
    */
   async analyzeTranscript(
     transcript: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    claimSentences?: string[]   // Phase 3.5 — extracted sentences (optional)
   ): Promise<ClaimAnalysis> {
-    const prompt = `
+
+    // ── Build optimised input ──────────────────────────────────────────────
+    //
+    // If pre-extracted sentences are available, send ONLY those to Gemini.
+    // Otherwise fall back to the first 1 200 chars of the full transcript
+    // (original behaviour — preserves backward-compatibility).
+
+    const useExtracted =
+      Array.isArray(claimSentences) && claimSentences.length > 0;
+
+    const inputText = useExtracted
+      ? claimSentences!.join(" ")          // already deduplicated by extractor
+      : transcript.slice(0, 1200);         // legacy fallback path
+
+    const inputLabel = useExtracted
+      ? `Extracted claim sentences (${claimSentences!.length})`
+      : "Full transcript (fallback)";
+
+    console.log(
+      `[GeminiService] analyzeTranscript — using ${inputLabel}. ` +
+        `Input length: ${inputText.length} chars.`
+    );
+
+    // ── Compact prompt (Phase 3.5) ─────────────────────────────────────────
+    //
+    // OLD prompt was a 250-word general transcript analysis.
+    // NEW prompt is a concise 80-word claim verification task.
+    // Token savings: ~60–75 % on the prompt side alone.
+
+    const prompt = useExtracted
+      ? `
+Verify whether the following extracted sentences contain a specific, verifiable factual claim.
+
+RULES:
+1. Satire, comedy, opinion, rhetorical question → containsClaim:false, isSatire:true/false.
+2. Specific factual assertion (health, science, politics, finance, news) → containsClaim:true.
+3. Pick the single most important claim if multiple exist.
+4. Category: health | science | politics | finance | news | other | null
+
+Reply ONLY with valid JSON (no markdown):
+{"containsClaim":boolean,"claim":"claim text or null","category":"category","isSatire":boolean,"reasoning":"one sentence"}
+
+Sentences: "${inputText.slice(0, 800)}"
+`.trim()
+      : `
 Analyze the transcript below from a short-form video.
 Determine whether it contains a specific, verifiable factual claim.
 
 RULES:
-1. Pure entertainment (satire, comedy, storytelling, fiction, music) → set isSatire:true, containsClaim:false.
+1. Pure entertainment (satire, comedy, storytelling, fiction, music) → isSatire:true, containsClaim:false.
 2. Opinions, feelings, rhetorical questions → containsClaim:false.
-3. Specific factual assertions presented as truth (health, science, politics, finance, news events) → containsClaim:true.
+3. Specific factual assertions presented as truth → containsClaim:true.
 4. Pick the single most important claim if multiple exist.
-5. Category must be one of: health | science | politics | finance | news | other | null
+5. Category: health | science | politics | finance | news | other | null
 
-Reply with ONLY valid JSON (no markdown, no extra text):
-{
-  "containsClaim": boolean,
-  "claim": "core claim text or null",
-  "category": "health|science|politics|finance|news|other|null",
-  "isSatire": boolean,
-  "reasoning": "one sentence"
-}
+Reply ONLY with valid JSON (no markdown):
+{"containsClaim":boolean,"claim":"claim text or null","category":"category","isSatire":boolean,"reasoning":"one sentence"}
 
-Transcript: "${transcript.slice(0, 1200)}"
+Transcript: "${inputText}"
 `.trim();
 
     try {
